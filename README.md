@@ -40,4 +40,4 @@ Original idea: [Roman Arutyunyan](https://github.com/arut)
 
 This module implementation: [Ilya V. Matveychikov](https://github.com/milabs)
 
-2018, 2019, 2020
+2018, 2019, 2020, 2025

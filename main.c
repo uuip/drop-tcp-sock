@@ -14,6 +14,10 @@
 #include <linux/proc_fs.h>
 #include <linux/ctype.h>
 #include <linux/inet.h>
+#include <linux/kallsyms.h>
+#ifdef CONFIG_KPROBES
+# include <linux/kprobes.h>
+#endif
 
 #include <net/tcp.h>
 #include <net/net_namespace.h>
@@ -28,6 +32,35 @@
 #endif
 
 #define DTS_PDE_NAME "tcpdropsock"
+
+static long lookupName = 0;
+module_param(lookupName, long, 0);
+
+// kernel module loader STB_WEAK binding hack
+extern __attribute__((weak)) unsigned long kallsyms_lookup_name(const char *);
+
+static unsigned long lookup_name(const char *name)
+{
+	static typeof(kallsyms_lookup_name) *lookup = kallsyms_lookup_name;
+#ifdef CONFIG_KPROBES
+	if (NULL == lookup) {
+		struct kprobe probe;
+		int callback(struct kprobe *p, struct pt_regs *regs) {
+			return 0;
+		}
+		memset(&probe, 0, sizeof(probe));
+		probe.pre_handler = callback;
+		probe.symbol_name = "kallsyms_lookup_name";
+		if (!register_kprobe(&probe)) {
+			lookup = (void *)probe.addr;
+			unregister_kprobe(&probe);
+		}
+	}
+#endif
+	if (NULL == lookup)
+		lookup = (void *)lookupName;
+	return lookup ? lookup(name) : 0;
+}
 
 struct dts_data {
 	uint32_t len;
@@ -47,12 +80,23 @@ struct dts_inet {
 	uint32_t addr[ 4 ];
 };
 
+static void *tcp_hashinfop(void)
+{
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 15, 0)
+	static unsigned long addr = 0;
+	if (!addr) addr = lookup_name("tcp_hasinfo");
+	return (void *)addr;
+#else
+	return &tcp_hashinfo;
+#endif
+}
+
 static void dts_kill(struct net *net, const struct dts_inet *src, const struct dts_inet *dst)
 {
 	struct sock *sk = NULL;
 
 	if (!src->ipv6) {
-		sk = inet_lookup(net, &tcp_hashinfo,
+		sk = inet_lookup(net, tcp_hashinfop(),
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 6, 0)
 			NULL, 0,
 #endif
@@ -60,7 +104,7 @@ static void dts_kill(struct net *net, const struct dts_inet *src, const struct d
 			(__be32)src->addr[0], htons(src->port), 0);
 		if (!sk) return;
 	} else {
-		sk = inet6_lookup(net, &tcp_hashinfo,
+		sk = inet6_lookup(net, tcp_hashinfop(),
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 6, 0)
 			NULL, 0,
 #endif
@@ -159,7 +203,9 @@ static int dts_proc_release(struct inode *inode, struct file *file)
 {
 	struct dts_data *d = file->private_data;
 	if (d) {
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 17, 0)
+		dts_process(pde_data(file_inode(file)), d);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(3, 10, 0)
 		dts_process(PDE_DATA(file_inode(file)), d);
 #else
 		dts_process(PDE(file->f_path.dentry->d_inode)->data, d);
@@ -260,9 +306,14 @@ static inline void dts_unregister_pernet(void)
 
 ////////////////////////////////////////////////////////////////////////////////
 
-int init_module(void)
+static int __init dts_module_init(void)
 {
 	int res = 0;
+
+	if (!tcp_hashinfop()) {
+		printk("DTS: no tcp_hashinfo found\n");
+		return -EINVAL;
+	}
 
 	res = dts_register_pernet();
 	if (res) return res;
@@ -270,10 +321,15 @@ int init_module(void)
 	return 0;
 }
 
-void cleanup_module(void)
+module_init(dts_module_init);
+
+static void __exit dts_module_exit(void)
 {
 	dts_unregister_pernet();
 }
 
+module_exit(dts_module_exit);
+
 MODULE_AUTHOR("Ilya V. Matveychikov <matvejchikov@gmail.com>");
 MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("TIME-WAIT sockets killer");
